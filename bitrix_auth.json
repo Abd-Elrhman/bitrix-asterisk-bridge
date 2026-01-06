@@ -1,8 +1,0 @@
-{
-  "access_token": "b3e05b69007f8ee50000c4f00000053cf0f10752dc5a52af59eab44f7b7baa1b12c1ba",
-  "refresh_token": "a35f8369007f8ee50000c4f00000053cf0f107dbd074ba82256fef3c3e2368c3878968",
-  "domain": "hub.zfholdingco.com",
-  "server_endpoint": "https://oauth.bitrix.info/rest/",
-  "member_id": "9a9412f029c26a934b1a6ea08dabb4ba",
-  "expires_at": 1767628980694
-}
