@@ -1,7 +1,8 @@
 node_modules/
 .env
-bitrix_auth.json
-bitrix_oauth_tokens.json
+storage/*.json
+users.json
 *.log
 npm-debug.log*
 .DS_Store
+*.sw*
