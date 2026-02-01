@@ -14,5 +14,9 @@ module.exports = {
   BITRIX_PORTAL: process.env.BITRIX_PORTAL,
   BITRIX_CLIENT_ID: process.env.BITRIX_CLIENT_ID,
   BITRIX_CLIENT_SECRET: process.env.BITRIX_CLIENT_SECRET,
+
+  // Call recording options (optional)
+  RECORDINGS_DIR: process.env.RECORDINGS_DIR || "/var/spool/asterisk/monitor",
+  RECORDING_PUBLIC_BASE: process.env.RECORDING_PUBLIC_BASE || "",
 };
 

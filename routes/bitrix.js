@@ -12,10 +12,24 @@ const router = express.Router();
 
 // load mapping once
 const userMap = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "users.json"), "utf8"));
+const extToUserId = Object.entries(userMap).reduce((acc, [userId, ext]) => {
+  acc[String(ext)] = String(userId);
+  return acc;
+}, {});
 
 function agentChannelForExt(ext) {
   if (ext === "202") return "SIP/202";
   return `PJSIP/${ext}`;
+}
+
+function authorizeBitrix(req) {
+  const token =
+    req.header("X-B24-Bridge-Token") ||
+    req.query?.secret ||
+    req.body?.secret;
+
+  if (!env.BRIDGE_TOKEN) return false;
+  return token === env.BRIDGE_TOKEN;
 }
 
 // Bitrix REST helper using OAuth
@@ -33,37 +47,231 @@ async function b24(method, params = {}) {
   return res.data;
 }
 
+async function registerAndShowCall(bitrixUserId, phone, type = 2) {
+  if (!env.BITRIX_WEBHOOK_BASE) return null;
+  const reg = await bitrixCall("telephony.externalcall.register", {
+    USER_ID: Number(bitrixUserId),
+    PHONE_NUMBER: phone,
+    TYPE: type,
+    CRM_CREATE: 1,
+  });
+  const bitrixCallId = reg?.result?.CALL_ID || null;
+  if (bitrixCallId) {
+    await bitrixCall("telephony.externalcall.show", { CALL_ID: bitrixCallId });
+  }
+  return bitrixCallId;
+}
+
+function channelPrefix(ch) {
+  if (!ch) return "";
+  // Strip any ;1 suffix and the -xxxx unique suffix
+  const semi = ch.split(";")[0];
+  return semi.split("-")[0];
+}
+
+function trackActiveByChannels(channels = [], info) {
+  const ts = Date.now();
+  channels
+    .map(channelPrefix)
+    .filter(Boolean)
+    .forEach((prefix) => {
+      const key = `chan:${prefix}`;
+      active.set(key, { ...info, startedAt: ts });
+    });
+}
+
+function trackActiveByUniqueId(uid, info) {
+  if (!uid) return;
+  active.set(`uid:${uid}`, { ...info, startedAt: Date.now() });
+}
+
+function trackActiveByLinkedId(linkedId, info) {
+  if (!linkedId) return;
+  active.set(`lid:${linkedId}`, { ...info, startedAt: Date.now() });
+}
+
+function resolveActiveFromEvent(evt) {
+  if (!evt) return null;
+  // Prefer channel prefix match because Uniqueid is not available from originate response
+  if (evt.Channel) {
+    for (const [key, value] of active.entries()) {
+      if (key.startsWith("chan:")) {
+        const prefix = key.slice(5);
+        if (evt.Channel.startsWith(prefix)) return { key, value };
+      }
+    }
+  }
+  if (evt.Uniqueid) {
+    const key = `uid:${evt.Uniqueid}`;
+    if (active.has(key)) return { key, value: active.get(key) };
+  }
+  if (evt.Linkedid) {
+    const key = `lid:${evt.Linkedid}`;
+    if (active.has(key)) return { key, value: active.get(key) };
+  }
+  return null;
+}
+
 // Finish tracking (optional)
 const active = new Map();
-ami.on("event", async (evt) => {
-  if (evt.Event === "Hangup" && evt.Uniqueid && active.has(evt.Uniqueid)) {
-    const info = active.get(evt.Uniqueid);
-    active.delete(evt.Uniqueid);
+const callerByLinkedId = new Map();
 
-    if (env.BITRIX_WEBHOOK_BASE && info.bitrixCallId) {
-      try {
-        await bitrixCall("telephony.externalcall.finish", {
-          CALL_ID: info.bitrixCallId,
-          STATUS_CODE: "200",
-          DURATION: Number(evt.Duration || 0),
-          COST: 0,
-        });
-        console.log("Bitrix finished call:", info.bitrixCallId);
-      } catch (e) {
-        console.error("Bitrix finish error:", e.message);
-      }
+function statusCodeFromHangup(evt) {
+  const cause = Number(evt?.Cause || 0);
+  switch (cause) {
+    case 16: return "200"; // normal clearing
+    case 17: return "603"; // user busy
+    case 18:
+    case 19: return "304"; // no answer / no user responding
+    case 21: return "487"; // call rejected
+    default: return "200";
+  }
+}
+
+const RECORDINGS_ROOT = env.RECORDINGS_DIR || "/var/spool/asterisk/monitor";
+
+function recordingPathFromUniqueId(uid) {
+  if (!uid) return null;
+  const tsSec = Number(String(uid).split(".")[0] || 0);
+  if (!Number.isFinite(tsSec) || tsSec <= 0) return null;
+
+  // Use local time to match Issabel folder structure YYYY/MM/DD
+  const d = new Date(tsSec * 1000);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return path.join(RECORDINGS_ROOT, String(yyyy), mm, dd);
+}
+
+function findRecordingByUniqueId(uid) {
+  try {
+    const baseDir = recordingPathFromUniqueId(uid);
+    if (!baseDir) return null;
+    const fs = require("fs");
+    const files = fs.readdirSync(baseDir);
+    const match = files.find((f) => f.includes(uid));
+    if (!match) return null;
+    const full = path.join(baseDir, match);
+    const rel = path.relative(RECORDINGS_ROOT, full).replace(/\\/g, "/");
+    const urlBase = (env.RECORDING_PUBLIC_BASE || "").replace(/\/$/, "");
+    const url = urlBase ? `${urlBase}/${rel}` : null;
+    return { path: full, url };
+  } catch {
+    return null;
+  }
+}
+
+function storeCallerHint(evt) {
+  if (!evt?.Linkedid) return;
+  const rawPhone =
+    evt.CallerIDNum ||
+    evt.CallerIDName ||
+    evt.ConnectedLineNum ||
+    evt.ConnectedLineName;
+  const phone = normalizeEgyptNumber(rawPhone);
+  if (phone && phone.replace(/\D/g, "").length >= 6) {
+    callerByLinkedId.set(evt.Linkedid, phone);
+  }
+}
+
+function resolveInboundPhone(evt) {
+  const rawPhone =
+    evt.CallerIDNum ||
+    evt.CallerIDName ||
+    evt.ConnectedLineNum ||
+    evt.ConnectedLineName;
+  let phone = normalizeEgyptNumber(rawPhone);
+  if (phone && phone.replace(/\D/g, "").length >= 6) return phone;
+  if (evt.Linkedid && callerByLinkedId.has(evt.Linkedid)) {
+    return callerByLinkedId.get(evt.Linkedid);
+  }
+  return phone;
+}
+
+// Inbound call: register & show when agent phone is ringing
+ami.on("event", async (evt) => {
+  if (evt.Event === "Newchannel" || evt.Event === "Newstate") {
+    storeCallerHint(evt);
+  }
+
+  if (evt.Event !== "Newstate") return;
+  if (evt.ChannelStateDesc !== "Ringing") return;
+
+  const ext = evt.Exten || evt.Extension;
+  if (!ext) return;
+
+  const bitrixUserId = extToUserId[String(ext)];
+  if (!bitrixUserId) return; // no mapped Bitrix user for this extension
+
+  const phone = resolveInboundPhone(evt);
+  if (!phone) return;
+
+  try {
+    const bitrixCallId = await registerAndShowCall(bitrixUserId, phone, 1 /* inbound */);
+    if (bitrixCallId) {
+      console.log("Bitrix inbound registered", { ext, phone, bitrixCallId });
+      trackActiveByChannels([evt.Channel], { bitrixCallId, ext, phone, direction: "in" });
+      trackActiveByUniqueId(evt.Uniqueid, { bitrixCallId, ext, phone, direction: "in", linkedid: evt.Linkedid });
+      trackActiveByLinkedId(evt.Linkedid, { bitrixCallId, ext, phone, direction: "in", uniqueid: evt.Uniqueid });
+    }
+  } catch (e) {
+    console.error("Bitrix register/show error (inbound):", e.message);
+  }
+});
+
+ami.on("event", async (evt) => {
+  if (evt.Event !== "Hangup") return;
+  const match = resolveActiveFromEvent(evt);
+  if (!match) return;
+
+  const { key, value } = match;
+  active.delete(key);
+  if (evt.Linkedid) callerByLinkedId.delete(evt.Linkedid);
+
+  console.log("AMI HANGUP matched", { channel: evt.Channel, uniqueid: evt.Uniqueid, bitrixCallId: value.bitrixCallId });
+
+  if (env.BITRIX_WEBHOOK_BASE && value.bitrixCallId) {
+    const userId = value?.ext ? extToUserId[String(value.ext)] : null;
+    const statusCode = statusCodeFromHangup(evt);
+    const duration = evt.Duration
+      ? Number(evt.Duration)
+      : value.startedAt
+        ? Math.round((Date.now() - value.startedAt) / 1000)
+        : 0;
+    const recording = findRecordingByUniqueId(evt.Uniqueid || value.uniqueid || value.linkedid);
+    try {
+      await bitrixCall("telephony.externalcall.finish", {
+        CALL_ID: value.bitrixCallId,
+        STATUS_CODE: statusCode,
+        DURATION: duration,
+        COST: 0,
+        USER_PHONE_INNER: value.ext || undefined,
+        USER_ID: userId ? Number(userId) : undefined,
+        RECORD_URL: recording?.url,
+      });
+      console.log("Bitrix finished call:", value.bitrixCallId, "duration", duration, "status", statusCode, recording?.url ? "recording attached" : "");
+    } catch (e) {
+      const data = e?.response?.data;
+      console.error("Bitrix finish error:", e.message, data ? JSON.stringify(data) : "");
     }
   }
 });
 
 // POST /bitrix/outbound
 router.post("/outbound", async (req, res) => {
-  const phone = req.body.phone;
+  const phone = normalizeEgyptNumber(req.body.phone);
   const userId = String(req.body.user_id || "");
 
   const extension = userMap[userId];
   if (!extension) return res.status(404).json({ ok: false, error: `No extension mapped for user ${userId}` });
   if (!phone) return res.status(400).json({ ok: false, error: "Missing phone" });
+
+  let bitrixCallId = null;
+  try {
+    bitrixCallId = await registerAndShowCall(userId, phone, 2);
+  } catch (err) {
+    console.error("Bitrix register/show error (outbound):", err.message);
+  }
 
   const action = {
     Action: "Originate",
@@ -85,7 +293,8 @@ router.post("/outbound", async (req, res) => {
     };
 
     console.log("AMI ORIGINATE OK:", safe);
-    return res.json({ ok: true, ami: safe });
+    trackActiveByChannels([action.Channel, action.Data], { bitrixCallId, ext: extension, phone });
+    return res.json({ ok: true, ami: safe, bitrixCallId, ext: extension, phone });
   } catch (e) {
     console.error("AMI ORIGINATE ERROR:", e?.message || e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -95,8 +304,7 @@ router.post("/outbound", async (req, res) => {
 // POST /bitrix/onExternalCallStart
 router.post("/onExternalCallStart", async (req, res) => {
   try {
-    const token = req.header("X-B24-Bridge-Token");
-    if (token !== env.BRIDGE_TOKEN) return res.status(401).json({ ok: false, error: "unauthorized" });
+    if (!authorizeBitrix(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
 
     const bitrixUserId =
       req.body?.data?.USER_ID ||
@@ -121,15 +329,10 @@ router.post("/onExternalCallStart", async (req, res) => {
 
     // Register/show in Bitrix (optional)
     let bitrixCallId = null;
-    if (env.BITRIX_WEBHOOK_BASE) {
-      const reg = await bitrixCall("telephony.externalcall.register", {
-        USER_ID: Number(bitrixUserId),
-        PHONE_NUMBER: phone,
-        TYPE: 2,
-        CRM_CREATE: 1,
-      });
-      bitrixCallId = reg?.result?.CALL_ID || null;
-      if (bitrixCallId) await bitrixCall("telephony.externalcall.show", { CALL_ID: bitrixCallId });
+    try {
+      bitrixCallId = await registerAndShowCall(bitrixUserId, phone, 2);
+    } catch (err) {
+      console.error("Bitrix register/show error (onExternalCallStart):", err.message);
     }
 
     const channel = agentChannelForExt(ext);
@@ -147,6 +350,7 @@ router.post("/onExternalCallStart", async (req, res) => {
 
     const r = await ami.action(action);
     console.log("Originate OK:", channel, "->", localDial, r?.Response);
+    trackActiveByChannels([channel, localDial], { bitrixCallId, ext, phone });
 
     return res.json({ ok: true, ext, phone, bitrixCallId });
   } catch (e) {
