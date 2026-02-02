@@ -367,9 +367,10 @@ router.post("/save-auth", (req, res) => {
 
 router.get("/bind", async (req, res) => {
   try {
+    if (!env.PUBLIC_BASE_URL) return res.status(500).json({ ok: false, error: "PUBLIC_BASE_URL not set" });
     const result = await b24("event.bind", {
       event: "OnExternalCallStart",
-      handler: "https://zfcall.ngrok.app/bitrix/onExternalCallStart"
+      handler: `${env.PUBLIC_BASE_URL}/bitrix/onExternalCallStart`
     });
     res.json({ ok: true, result });
   } catch (err) {
@@ -437,9 +438,10 @@ router.all("/handler", async (req, res) => {
     if (code) {
       const tokens = await oauthTokenExchange(code);
       saveB24Auth(tokens);
+      if (!env.PUBLIC_BASE_URL) return res.status(500).send("PUBLIC_BASE_URL not set");
       const bind = await callRestWithAccessToken("event.bind", tokens.access_token, {
         event: "OnExternalCallStart",
-        handler: "https://zfcall.ngrok.app/bitrix/onExternalCallStart"
+        handler: `${env.PUBLIC_BASE_URL}/bitrix/onExternalCallStart`
       });
       return res.status(200).send("Installed + event bound ✅");
     }

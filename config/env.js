@@ -15,6 +15,9 @@ module.exports = {
   BITRIX_CLIENT_ID: process.env.BITRIX_CLIENT_ID,
   BITRIX_CLIENT_SECRET: process.env.BITRIX_CLIENT_SECRET,
 
+  // Public URL for webhooks (Cloudflare Tunnel, ngrok, etc.) — no trailing slash
+  PUBLIC_BASE_URL: (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, ""),
+
   // Call recording options (optional)
   RECORDINGS_DIR: process.env.RECORDINGS_DIR || "/var/spool/asterisk/monitor",
   RECORDING_PUBLIC_BASE: process.env.RECORDING_PUBLIC_BASE || "",
